@@ -3,6 +3,14 @@ export interface Article {
   views: number;
   growth?: number;
   growthPercentage?: number;
+  previousViews?: number;
+  reliability?: 'low' | 'medium' | 'high';
+  metadata?: {
+    description?: string;
+    thumbnail?: string;
+    categories?: string[];
+    extract?: string;
+  };
   languages?: Record<string, number>;
   mainLanguage?: string;
   dailyViews?: number[];
@@ -16,4 +24,35 @@ export interface ApiResponse {
   items: {
     articles: Article[];
   }[];
+}
+
+export interface WikipediaCategory {
+  title: string;
+  pageId?: number;
+  ns?: number;
+}
+
+export interface ThumbnailInfo {
+  source: string;
+  width?: number;
+  height?: number;
+}
+
+export interface MediaWikiResponse {
+  query: {
+    pages: {
+      pageid?: number;
+      ns?: number;
+      title: string;
+      description?: string;
+      thumbnail?: ThumbnailInfo;
+      categories?: WikipediaCategory[];
+      extract?: string;
+    }[];
+  };
+}
+
+export interface ViewHistory {
+  date: string;
+  views: number;
 }
