@@ -2,62 +2,62 @@ import { Article, Language, Period, ApiResponse, MediaWikiResponse } from './typ
 import { format, subDays } from 'date-fns';
 
 const API_BASE = "https://wikimedia.org/api/rest_v1/metrics/pageviews";
-const USER_AGENT = "HelvetiScan/1.0 (educational project; contact@example.com)";
+const USER_AGENT = "HelvetiScan/1.0 (educational project)";
 
-// Implémentation d'un cache simple en mémoire
-const cache: Record<string, { data: any, timestamp: number }> = {};
-const CACHE_TTL = 15 * 60 * 1000; // 15 minutes en millisecondes
+// Cache borné en mémoire (max 100 entrées)
+const MAX_CACHE_SIZE = 100;
+const cache: Map<string, { data: unknown; timestamp: number }> = new Map();
+const CACHE_TTL = 15 * 60 * 1000; // 15 minutes
 
 /**
  * Récupère les données depuis l'API avec cache et retry
  */
-async function fetchFromAPI(url: string): Promise<any> {
-  const cacheKey = url;
+async function fetchFromAPI<T = unknown>(url: string): Promise<T> {
   const now = Date.now();
-  
+
   // Vérifier le cache
-  if (cache[cacheKey] && (now - cache[cacheKey].timestamp) < CACHE_TTL) {
-    console.log(`[Cache hit] ${url}`);
-    return cache[cacheKey].data;
+  const cached = cache.get(url);
+  if (cached && (now - cached.timestamp) < CACHE_TTL) {
+    return cached.data as T;
   }
-  
+
   // Logique de retry avec backoff exponentiel
   let retries = 3;
   let delay = 1000;
-  let lastError;
-  
+  let lastError: unknown;
+
   while (retries > 0) {
     try {
-      console.log(`[API Request] ${url}`);
       const response = await fetch(url, {
-        headers: {
-          'User-Agent': USER_AGENT
-        }
+        headers: { 'User-Agent': USER_AGENT }
       });
-      
+
       if (!response.ok) {
         throw new Error(`API request failed: ${response.statusText} (${response.status})`);
       }
-      
+
       const data = await response.json();
-      
-      // Mettre en cache les résultats
-      cache[cacheKey] = { data, timestamp: now };
-      
-      return data;
+
+      // Borner la taille du cache
+      if (cache.size >= MAX_CACHE_SIZE) {
+        const oldestKey = cache.keys().next().value;
+        if (oldestKey) cache.delete(oldestKey);
+      }
+      cache.set(url, { data, timestamp: now });
+
+      return data as T;
     } catch (error) {
       console.error(`Attempt failed for ${url}:`, error);
       lastError = error;
       retries--;
-      
+
       if (retries > 0) {
-        // Attendre avec un délai exponentiel avant de réessayer
         await new Promise(resolve => setTimeout(resolve, delay));
-        delay *= 2; // Backoff exponentiel
+        delay *= 2;
       }
     }
   }
-  
+
   throw lastError;
 }
 
@@ -73,76 +73,76 @@ function filterUnwantedPages(articles: Article[]): Article[] {
     'Usuario:', 'Talk:', 'Discussion:', 'Diskussion:', 'Discusión:'
   ];
 
-  const unwantedPages = [
+  const unwantedPages = new Set([
     'Wikipédia:Accueil_principal', 'Wikipedia:Main_Page',
     'Wikipedia:Hauptseite', 'Wikipedia:Portada',
     'Cookie_(informatique)', 'HTTP_cookie', 'Cookie',
     'Recherche', 'Search', 'Suche', 'Búsqueda'
-  ];
+  ]);
 
   return articles.filter(article => {
     const decodedTitle = decodeURIComponent(article.article);
     return !unwantedPrefixes.some(prefix => decodedTitle.startsWith(prefix)) &&
-           !unwantedPages.some(page => decodedTitle === page);
+           !unwantedPages.has(decodedTitle);
   });
+}
+
+/**
+ * Calcule le nombre de jours à récupérer selon la période.
+ * Note : l'API /top ne retourne que les données pour un jour donné.
+ * Pour les périodes > daily, on récupère le jour le plus récent.
+ */
+function getDaysToSubtract(period: Period): number {
+  switch (period) {
+    case '48h': return 1;
+    case 'weekly': return 1;
+    case 'monthly': return 1;
+    case 'daily':
+    default: return 1;
+  }
 }
 
 /**
  * Récupère les articles les plus consultés
  */
 export async function fetchTopArticles(language: Language, period: Period, swissOnly: boolean): Promise<Article[]> {
-  try {
-    const date = new Date();
-    const formattedDate = format(subDays(date, 1), 'yyyyMMdd');
-    const project = `${language}.wikipedia`;
-    
-    const url = `${API_BASE}/top/${project}/all-access/${formattedDate.slice(0, 4)}/${formattedDate.slice(4, 6)}/${formattedDate.slice(6, 8)}`;
-    
-    const data = await fetchFromAPI(url) as ApiResponse;
-    let articles = data.items[0].articles;
-    
-    // Filtrer d'abord les pages non désirées
-    articles = filterUnwantedPages(articles);
+  const date = new Date();
+  const formattedDate = format(subDays(date, getDaysToSubtract(period)), 'yyyyMMdd');
+  const project = `${language}.wikipedia`;
 
-    if (swissOnly) {
-      // Méthode améliorée pour le filtrage suisse
-      articles = await filterSwissArticlesV2(articles, language);
-    }
-    
-    // Récupérer les métadonnées pour enrichir les articles
-    if (articles.length > 0) {
-      const enrichedArticles = await enrichArticlesWithMetadata(articles, language);
-      return enrichedArticles.slice(0, 50);
-    }
-    
-    // Limiter à 50 articles après le filtrage
-    return articles.slice(0, 50);
-  } catch (error) {
-    console.error('Error fetching top articles:', error);
-    return [];
+  const url = `${API_BASE}/top/${project}/all-access/${formattedDate.slice(0, 4)}/${formattedDate.slice(4, 6)}/${formattedDate.slice(6, 8)}`;
+
+  const data = await fetchFromAPI<ApiResponse>(url);
+  let articles = data.items[0].articles;
+
+  articles = filterUnwantedPages(articles);
+
+  if (swissOnly) {
+    articles = await filterSwissArticlesV2(articles, language);
   }
+
+  if (articles.length > 0) {
+    const enrichedArticles = await enrichArticlesWithMetadata(articles, language);
+    return enrichedArticles.slice(0, 50);
+  }
+
+  return articles.slice(0, 50);
 }
 
 /**
  * Récupère les articles en progression
  */
 export async function fetchTrendingArticles(language: Language, period: Period, swissOnly: boolean): Promise<Article[]> {
-  try {
-    // Pour les articles en tendance, on récupère plus d'articles initialement
-    const currentData = await fetchTopArticles(language, period, false);
-    const previousData = await fetchPreviousPeriodData(language, period);
+  const currentData = await fetchTopArticles(language, period, false);
+  const previousData = await fetchPreviousPeriodData(language, period);
 
-    let trendingArticles = calculateTrendsImproved(currentData, previousData);
-    
-    if (swissOnly) {
-      trendingArticles = await filterSwissArticlesV2(trendingArticles, language);
-    }
+  let trendingArticles = calculateTrendsImproved(currentData, previousData);
 
-    return trendingArticles.slice(0, 50);
-  } catch (error) {
-    console.error('Error fetching trending articles:', error);
-    return [];
+  if (swissOnly) {
+    trendingArticles = await filterSwissArticlesV2(trendingArticles, language);
   }
+
+  return trendingArticles.slice(0, 50);
 }
 
 /**
@@ -168,45 +168,39 @@ async function fetchPreviousPeriodData(language: Language, period: Period): Prom
   const project = `${language}.wikipedia`;
   const url = `${API_BASE}/top/${project}/all-access/${formattedDate.slice(0, 4)}/${formattedDate.slice(4, 6)}/${formattedDate.slice(6, 8)}`;
 
-  try {
-    const data = await fetchFromAPI(url) as ApiResponse;
-    let articles = data.items[0].articles;
-    articles = filterUnwantedPages(articles);
-    return articles;
-  } catch (error) {
-    console.error('Error fetching previous period data:', error);
-    return [];
-  }
+  const data = await fetchFromAPI<ApiResponse>(url);
+  let articles = data.items[0].articles;
+  articles = filterUnwantedPages(articles);
+  return articles;
 }
 
 /**
- * Calcul amélioré des tendances avec fiabilité
+ * Calcul amélioré des tendances avec fiabilité — utilise Map pour O(n)
  */
 function calculateTrendsImproved(currentArticles: Article[], previousArticles: Article[]): Article[] {
+  // Indexer les articles précédents par titre pour lookup O(1)
+  const previousMap = new Map(previousArticles.map(a => [a.article, a]));
+
   const trends = currentArticles.map(current => {
-    const previous = previousArticles.find(p => p.article === current.article);
+    const previous = previousMap.get(current.article);
     const previousViews = previous?.views || 0;
-    
-    // Éviter division par zéro et articles avec trop peu de vues
+
     if (previousViews < 100) {
       return {
         ...current,
         growth: 0,
         growthPercentage: 0,
         previousViews,
-        reliability: 'low'
+        reliability: 'low' as const
       };
     }
-    
+
     const growth = current.views - previousViews;
     const growthPercentage = (growth / previousViews) * 100;
-    
-    // Calculer un score de fiabilité basé sur le nombre de vues
-    let reliability = 'medium';
-    if (current.views > 10000 && previousViews > 1000) {
-      reliability = 'high';
-    }
-    
+
+    const reliability: 'low' | 'medium' | 'high' =
+      current.views > 10000 && previousViews > 1000 ? 'high' : 'medium';
+
     return {
       ...current,
       growth,
@@ -216,15 +210,12 @@ function calculateTrendsImproved(currentArticles: Article[], previousArticles: A
     };
   });
 
-  // Trier d'abord par fiabilité, puis par croissance
   return trends
     .filter(article => article.growth && article.growth > 0)
     .sort((a, b) => {
-      // Donner priorité aux articles à haute fiabilité
       if (a.reliability !== b.reliability) {
         return a.reliability === 'high' ? -1 : 1;
       }
-      // Ensuite trier par croissance
       return (b.growth || 0) - (a.growth || 0);
     });
 }
@@ -233,9 +224,6 @@ function calculateTrendsImproved(currentArticles: Article[], previousArticles: A
  * Filtre des articles liés à la Suisse (version améliorée)
  */
 async function filterSwissArticlesV2(articles: Article[], language: Language): Promise<Article[]> {
-  // Combiner les deux approches: mots-clés et catégories Wikipedia
-  
-  // 1. Approche par mots-clés (rapide)
   const swissTerms = {
     locations: [
       'zurich', 'zürich', 'genève', 'geneva', 'genf', 'basel', 'bâle', 'bern', 'berne',
@@ -250,61 +238,47 @@ async function filterSwissArticlesV2(articles: Article[], language: Language): P
     ]
   };
 
-  // Créer une liste unique de tous les termes
-  const allTerms = [...new Set([
-    ...swissTerms.locations,
-    ...swissTerms.general
-  ])];
+  const allTerms = [...new Set([...swissTerms.locations, ...swissTerms.general])];
 
-  // Premier filtre rapide avec les mots-clés
   const keywordFilteredArticles = articles.filter(article => {
-    const decodedTitle = decodeURIComponent(article.article.toLowerCase())
-      .replace(/_/g, ' ');
+    const decodedTitle = decodeURIComponent(article.article.toLowerCase()).replace(/_/g, ' ');
     return allTerms.some(term => decodedTitle.includes(term.toLowerCase()));
   });
 
-  // Si nous avons assez d'articles avec le filtre par mots-clés, on s'arrête là
   if (keywordFilteredArticles.length >= 10) {
     return keywordFilteredArticles;
   }
-  
-  // 2. Approche par catégories Wikipedia (plus précise mais plus lente)
+
   try {
-    // Récupérer les métadonnées pour les articles restants
-    const remainingArticles = articles.filter(article => 
+    const remainingArticles = articles.filter(article =>
       !keywordFilteredArticles.some(filtered => filtered.article === article.article)
     );
-    
-    // Limiter la taille des lots pour éviter de surcharger l'API
+
     const batchSize = 50;
     let allCategoryFiltered: Article[] = [...keywordFilteredArticles];
-    
+
     for (let i = 0; i < remainingArticles.length; i += batchSize) {
       const batch = remainingArticles.slice(i, i + batchSize);
       const enriched = await enrichArticlesWithMetadata(batch, language);
-      
+
       const swissCategoryKeywords = ['suisse', 'schweiz', 'switzerland', 'svizzera'];
-      
+
       const categoryFiltered = enriched.filter(article => {
         if (!article.metadata?.categories) return false;
-        
-        return article.metadata.categories.some(category => 
-          swissCategoryKeywords.some(keyword => 
+        return article.metadata.categories.some(category =>
+          swissCategoryKeywords.some(keyword =>
             category.toLowerCase().includes(keyword)
           )
         );
       });
-      
+
       allCategoryFiltered = [...allCategoryFiltered, ...categoryFiltered];
-      
-      // Si nous avons assez d'articles, on s'arrête
       if (allCategoryFiltered.length >= 50) break;
     }
-    
+
     return allCategoryFiltered;
   } catch (error) {
     console.error('Error during category filtering:', error);
-    // En cas d'erreur, on retourne les résultats du filtre par mots-clés
     return keywordFilteredArticles;
   }
 }
@@ -314,24 +288,23 @@ async function filterSwissArticlesV2(articles: Article[], language: Language): P
  */
 async function enrichArticlesWithMetadata(articles: Article[], language: Language): Promise<Article[]> {
   if (articles.length === 0) return [];
-  
+
   try {
-    // Diviser les articles en lots de 25 (limite de l'API MediaWiki)
     const batchSize = 25;
     const enrichedArticles: Article[] = [];
-    
+
     for (let i = 0; i < articles.length; i += batchSize) {
       const batch = articles.slice(i, i + batchSize);
-      const titles = batch.map(article => 
+      const titles = batch.map(article =>
         decodeURIComponent(article.article).replace(/_/g, ' ')
       );
-      
+
       const metadata = await getArticleMetadata(titles, language);
-      
+
       const enriched = batch.map(article => {
         const title = decodeURIComponent(article.article).replace(/_/g, ' ');
         const articleMetadata = metadata[title];
-        
+
         if (articleMetadata) {
           return {
             ...article,
@@ -343,13 +316,13 @@ async function enrichArticlesWithMetadata(articles: Article[], language: Languag
             }
           };
         }
-        
+
         return article;
       });
-      
+
       enrichedArticles.push(...enriched);
     }
-    
+
     return enrichedArticles;
   } catch (error) {
     console.error('Error enriching articles with metadata:', error);
@@ -360,27 +333,26 @@ async function enrichArticlesWithMetadata(articles: Article[], language: Languag
 /**
  * Récupère les métadonnées des articles via l'API MediaWiki
  */
-async function getArticleMetadata(titles: string[], language: Language): Promise<Record<string, any>> {
+async function getArticleMetadata(titles: string[], language: Language): Promise<Record<string, { description: string; thumbnail: string; categories: string[]; extract: string }>> {
   if (titles.length === 0) return {};
-  
+
   const titlesParam = titles.map(t => encodeURIComponent(t)).join('|');
   const url = `https://${language}.wikipedia.org/w/api.php?action=query&format=json&prop=pageimages|extracts|categories&exintro=1&explaintext=1&pithumbsize=100&pilimit=${titles.length}&cllimit=10&titles=${titlesParam}&formatversion=2&origin=*`;
-  
+
   try {
-    const data = await fetchFromAPI(url) as MediaWikiResponse;
+    const data = await fetchFromAPI<MediaWikiResponse>(url);
     const pages = data.query.pages;
-    
-    // Transformer la réponse en map titre => métadonnées
-    const metadata: Record<string, any> = {};
-    pages.forEach((page: any) => {
+
+    const metadata: Record<string, { description: string; thumbnail: string; categories: string[]; extract: string }> = {};
+    pages.forEach(page => {
       metadata[page.title] = {
         description: page.extract?.substring(0, 150) || '',
         thumbnail: page.thumbnail?.source || '',
-        categories: page.categories?.map((cat: any) => cat.title) || [],
+        categories: page.categories?.map(cat => cat.title) || [],
         extract: page.extract || ''
       };
     });
-    
+
     return metadata;
   } catch (error) {
     console.error('Error fetching article metadata:', error);
@@ -391,30 +363,25 @@ async function getArticleMetadata(titles: string[], language: Language): Promise
 /**
  * Récupère l'historique des vues quotidiennes pour un article
  */
-export async function fetchArticleViewHistory(article: string, language: Language, days: number = 30): Promise<any[]> {
-  try {
-    const today = new Date();
-    const startDate = new Date();
-    startDate.setDate(today.getDate() - days);
-    
-    const startFormatted = format(startDate, 'yyyyMMdd');
-    const endFormatted = format(today, 'yyyyMMdd');
-    
-    const encodedArticle = encodeURIComponent(article);
-    const url = `${API_BASE}/per-article/${language}.wikipedia/all-access/all-agents/${encodedArticle}/daily/${startFormatted}/${endFormatted}`;
-    
-    const data = await fetchFromAPI(url);
-    
-    if (!data.items || data.items.length === 0) {
-      return [];
-    }
-    
-    return data.items.map((item: any) => ({
-      date: `${item.timestamp.slice(0, 4)}-${item.timestamp.slice(4, 6)}-${item.timestamp.slice(6, 8)}`,
-      views: item.views
-    }));
-  } catch (error) {
-    console.error('Error fetching article view history:', error);
+export async function fetchArticleViewHistory(article: string, language: Language, days: number = 30): Promise<{ date: string; views: number }[]> {
+  const today = new Date();
+  const startDate = new Date();
+  startDate.setDate(today.getDate() - days);
+
+  const startFormatted = format(startDate, 'yyyyMMdd');
+  const endFormatted = format(today, 'yyyyMMdd');
+
+  const encodedArticle = encodeURIComponent(article);
+  const url = `${API_BASE}/per-article/${language}.wikipedia/all-access/all-agents/${encodedArticle}/daily/${startFormatted}/${endFormatted}`;
+
+  const data = await fetchFromAPI<{ items?: { timestamp: string; views: number }[] }>(url);
+
+  if (!data.items || data.items.length === 0) {
     return [];
   }
+
+  return data.items.map(item => ({
+    date: `${item.timestamp.slice(0, 4)}-${item.timestamp.slice(4, 6)}-${item.timestamp.slice(6, 8)}`,
+    views: item.views
+  }));
 }
